@@ -32,6 +32,26 @@ from sklearn.model_selection import train_test_split
 from scipy.stats import pearsonr
 import anthropic
 
+# Render runtime diagnostic: logs only package metadata, never credentials.
+def _log_opencv_runtime():
+    from importlib.metadata import PackageNotFoundError, version
+    import sys
+    print(f"[OPENCV CHECK] Python: {sys.version.split()[0]}", flush=True)
+    print(f"[OPENCV CHECK] cv2 path: {getattr(cv2, '__file__', None)}", flush=True)
+    print(f"[OPENCV CHECK] cv2 version: {getattr(cv2, '__version__', None)}", flush=True)
+    print(f"[OPENCV CHECK] CascadeClassifier available: {hasattr(cv2, 'CascadeClassifier')}", flush=True)
+    print(f"[OPENCV CHECK] HOGDescriptor available: {hasattr(cv2, 'HOGDescriptor')}", flush=True)
+    print(f"[OPENCV CHECK] Cascade data available: {hasattr(cv2, 'data')}", flush=True)
+    for package in ('opencv-python', 'opencv-python-headless',
+                    'opencv-contrib-python', 'opencv-contrib-python-headless'):
+        try:
+            print(f"[OPENCV CHECK] Installed {package}: {version(package)}", flush=True)
+        except PackageNotFoundError:
+            pass
+
+
+_log_opencv_runtime()
+
 # ── Environment & Configuration ──
 
 def load_dotenv(filepath=None):
@@ -1653,6 +1673,29 @@ Respond ONLY with valid JSON (no markdown): {"category": "<one of the values abo
 
 
 # ── Face quality screening (blur, multiple people, obscured faces) ──
+
+class OpenCVConfigurationError(RuntimeError):
+    """Indicates that this server cannot load the OpenCV face detector."""
+
+
+def load_face_cascade():
+    """Use the existing Haar detector, but report missing OpenCV bindings clearly."""
+    if not hasattr(cv2, 'CascadeClassifier'):
+        raise OpenCVConfigurationError(
+            'OpenCV runtime is incomplete: cv2.CascadeClassifier is missing. '
+            'Inspect the [OPENCV CHECK] entries in the Render logs.'
+        )
+    cascade_dir = getattr(getattr(cv2, 'data', None), 'haarcascades', None)
+    if not cascade_dir:
+        raise OpenCVConfigurationError('OpenCV Haar cascade data directory is missing.')
+    cascade_path = os.path.join(cascade_dir, 'haarcascade_frontalface_default.xml')
+    if not os.path.isfile(cascade_path):
+        raise OpenCVConfigurationError('OpenCV Haar cascade XML file is missing.')
+    detector = cv2.CascadeClassifier(cascade_path)
+    if detector.empty():
+        raise OpenCVConfigurationError('OpenCV failed to initialize the Haar face detector.')
+    return detector
+
 FACE_BLUR_HARD_MIN = 25.0  # Laplacian variance of the 128x128 face crop; real photos are almost always far above this
 FACE_QUALITY_MESSAGES = {
     'blurred': ("The face in this photo is too blurry or distorted (e.g. motion blur or artistic effect). "
@@ -1673,7 +1716,7 @@ def measure_face_sharpness(image_path):
     if img is None:
         return None
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    face_cascade = load_face_cascade()
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
     if len(faces) == 0:
         return None
@@ -1744,7 +1787,7 @@ def detect_face_present(image_path):
     if img is None:
         return False
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    face_cascade = load_face_cascade()
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
     return len(faces) > 0
 
@@ -1815,7 +1858,7 @@ def extract_face_embedding(image_path):
         if img is None:
             return None, None, "Could not read image file."
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        face_cascade = load_face_cascade()
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
 
         # Reject image immediately if no face is detected
@@ -3313,6 +3356,14 @@ Respond ONLY with valid JSON (no markdown):
         return jsonify({'success': True, 'ok': True, 'status': 'PASSED',
                         'ai_check_status': ai_res['status'],
                         'ai_check_error': ai_res['reason'] if ai_res['status'] == 'UNAVAILABLE' else None})
+    except OpenCVConfigurationError as e:
+        app.logger.exception('OpenCV face detection unavailable during /check_photo')
+        return jsonify({
+            'success': False,
+            'ok': False,
+            'status': 'UNAVAILABLE',
+            'error': 'Face detection service unavailable: OpenCV is not correctly installed on the server. Check Render logs.'
+        }), 503
     except (json.JSONDecodeError, ValueError) as e:
         return jsonify({
             'success': False,

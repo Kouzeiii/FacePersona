@@ -62,12 +62,15 @@
                 <td class="bg-cell">{{ r.background or '—' }}</td>
                 <td class="flag-cell">{% if r.flags %}{% for f in r.flags %}<span class="quality-flag">⚠ {{ f }}</span>{% endfor %}{% else %}<span class="quality-ok">✓ OK</span>{% endif %}</td>
                 <td>
-                    <form method="POST" action="{{ url_for('researcher_delete_participant') }}"
-                          onsubmit="return confirm('Delete {{ r.participant_id }} and their photo? This cannot be undone.');">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <input type="hidden" name="participant_id" value="{{ r.participant_id }}">
-                        <button type="submit" class="btn btn-ghost btn-sm" title="Delete participant data">✕ Delete</button>
-                    </form>
+                    <div class="action-cell">
+                        <a class="btn btn-ghost btn-sm" href="{{ url_for('researcher_computation', type='private', id=r.participant_id) }}">Computation</a>
+                        <form method="POST" action="{{ url_for('researcher_delete_participant') }}"
+                              onsubmit="return confirm('Delete {{ r.participant_id }} and their photo? This cannot be undone.');">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <input type="hidden" name="participant_id" value="{{ r.participant_id }}">
+                            <button type="submit" class="btn-icon btn-danger-ghost" title="Delete {{ r.participant_id }}" aria-label="Delete {{ r.participant_id }}">✕</button>
+                        </form>
+                    </div>
                 </td>
             </tr>
             {% endfor %}

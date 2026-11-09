@@ -14,7 +14,7 @@
 <body>
     <nav class="navbar" role="navigation" aria-label="Main Navigation">
         <div class="nav-inner">
-            <a href="{{ url_for('index') }}" class="nav-brand" aria-label="FacePersona Intelligence Studio">
+            <a href="{{ url_for('home') }}" class="nav-brand" aria-label="FacePersona Intelligence Studio">
                 <span class="brand-logo-mark" aria-hidden="true">
                     <svg width="26" height="26" viewBox="0 0 26 26" fill="none" xmlns="http://www.w3.org/2000/svg">
                         <rect x="1" y="1" width="24" height="24" rx="7" fill="url(#navBrandGrad)" stroke="rgba(255,255,255,0.2)" stroke-width="1"/>
@@ -69,13 +69,8 @@
                 </a>
                 <form method="POST" action="{{ url_for('deauthorize_researcher') }}" class="nav-lock-form">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <button type="submit" class="nav-link nav-lock-btn" title="Lock researcher view">🔒 Lock</button>
+                    <button type="submit" class="nav-link nav-lock-btn" title="Log out of researcher view">Log out</button>
                 </form>
-                {% else %}
-                <a href="{{ url_for('researcher_login') }}" class="nav-link {% if request.endpoint == 'researcher_login' %}active{% endif %}">
-                    <span class="nav-link-dot" aria-hidden="true"></span>
-                    <span>Researcher Login</span>
-                </a>
                 {% endif %}
             </div>
         </div>
@@ -93,6 +88,10 @@
                 <span>OpenCV HOG × Claude AI × Scikit-Learn</span>
                 <span class="footer-divider">·</span>
                 <span>Capstone Project</span>
+                {% if not researcher_nav %}
+                <span class="footer-divider">·</span>
+                <a href="{{ url_for('researcher_login') }}" class="footer-researcher-link">Researcher Login</a>
+                {% endif %}
             </div>
         </div>
     </footer>

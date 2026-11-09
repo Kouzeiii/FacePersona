@@ -16,10 +16,6 @@
         </div>
         <div class="page-hero-actions">
             {% if is_authorized %}
-            <form method="POST" action="{{ url_for('deauthorize_researcher') }}" style="display:inline">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <button type="submit" class="btn btn-ghost">🔒 Lock Researcher View</button>
-            </form>
             <button class="btn btn-ghost" id="retrainBtn">Retrain Model</button>
             {% else %}
             <button class="btn btn-ghost js-unlock-researcher-btn">Researcher Unlock</button>
@@ -100,9 +96,11 @@
                     <span class="badge badge-amber">⟳ Pending</span>
                     {% endif %}
                 </td>
-                <td style="display:flex;gap:8px;align-items:center">
+                <td>
+                    <div class="action-cell">
                     {% if subject.has_personality %}
                     <a href="{{ url_for('profile', name=subject.name) }}" class="btn btn-sm btn-ghost">View Profile</a>
+                    <a href="{{ url_for('researcher_computation', type='subject', id=subject.name) }}" class="btn btn-sm btn-ghost">Computation</a>
                     {% endif %}
                     {% if is_authorized %}
                     <button class="btn-icon btn-danger-ghost js-delete-subject-btn"
@@ -111,6 +109,7 @@
                             title="Remove"
                             aria-label="Remove {{ subject.name }}">✕</button>
                     {% endif %}
+                    </div>
                 </td>
             </tr>
             {% endfor %}

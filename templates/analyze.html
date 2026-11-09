@@ -31,12 +31,15 @@
         <div class="step-block private-only">
             <div class="step-badge">Step 1 — Consent &amp; Info</div>
             <div class="consent-box">
-                <p>This is an academic study. Your <strong>photo, age range, and answers</strong> are used only for this research,
-                stored locally by the researchers, and never shown publicly. <strong>Your name is not collected.</strong>
-                You will get a Participant ID that you can use to ask the researchers to delete your data.</p>
+                <p class="consent-law">🛡️ <strong>Data Privacy Notice — Republic Act No. 10173 (Data Privacy Act of 2012)</strong></p>
+                <p>This is an academic study. Your <strong>photo, age range, and answers</strong> are collected only for this research,
+                stored securely by the researchers, and never shown publicly. <strong>Your name is not collected.</strong></p>
+                <p>Under RA 10173, you have the right to <strong>be informed</strong>, to <strong>access</strong> and <strong>correct</strong> your data,
+                to <strong>object</strong>, and to <strong>request deletion</strong> or <strong>withdraw your consent</strong> at any time. Just give your
+                Participant ID to the researchers. You may also file a complaint with the National Privacy Commission (NPC).</p>
                 <label class="consent-check">
                     <input type="checkbox" id="privateConsent">
-                    <span>I am <strong>18 or older</strong> and I agree to take part.</span>
+                    <span>I am <strong>18 or older</strong>, I have read this notice, and I give my consent under <strong>RA 10173</strong> to take part.</span>
                 </label>
             </div>
             <div class="form-group" style="margin-top:1rem">
@@ -77,8 +80,11 @@
         </div>
 
         <!-- STEP 2: Image -->
-        <div class="step-block">
+        <div class="step-block" id="photoStepBlock">
             <div class="step-badge">Step 2 — Photo</div>
+            <div class="consent-lock-note private-only" id="consentLockNote">🔒 Please tick the consent box in Step 1 first. Then you can upload your photo.</div>
+            <div class="photo-cooldown-note private-only hidden" id="photoCooldownNote" role="status" aria-live="polite"></div>
+            <div class="photo-attempts-note private-only hidden" id="photoAttemptsNote"></div>
             <div class="image-source-tabs">
                 <button class="img-tab active public-only" onclick="switchImgTab('url')">🔗 From URL</button>
                 <button class="img-tab" onclick="switchImgTab('upload')">⊕ Upload</button>
@@ -96,7 +102,7 @@
 
             <!-- Upload Tab -->
             <div id="imgTabUpload" class="img-tab-content">
-                <div class="upload-zone" id="uploadZone" onclick="document.getElementById('photoInput').click()">
+                <div class="upload-zone" id="uploadZone" onclick="openPhotoPicker()">
                     <input type="file" id="photoInput" accept=".jpg,.jpeg,.png,.bmp,.webp" style="display:none" onchange="previewPhoto(this)">
                     <div id="uploadPlaceholder">
                         <div class="upload-icon">⊕</div>
@@ -116,6 +122,10 @@
                     <img id="photoPreview" class="photo-preview" alt="Subject Photo Preview">
                     <button class="clear-img-btn" onclick="clearImage()" title="Remove image" aria-label="Remove image">✕</button>
                 </div>
+            </div>
+            <div id="photoCheckStatus" class="photo-check-status hidden" role="status" aria-live="polite">
+                <span class="spinner-sm"></span>
+                <span>Checking your photo (face, clarity, AI-generated, content)… this usually takes a few seconds.</span>
             </div>
         </div>
 
@@ -199,6 +209,7 @@
         <div class="results-header">
             <div>
                 <div class="results-name" id="resultsName"></div>
+                <div class="results-type" id="resultsType"></div>
                 <div class="results-sub" id="resultsSub">Dual-Pipeline Evaluation: AI Narrative Inference &amp; Facial ML Prediction</div>
             </div>
             <div class="results-tag">Analysis Complete</div>
@@ -243,7 +254,9 @@
 
         <div class="results-actions">
             <button class="btn btn-primary" onclick="startNewAssessment()">✦ Start New Assessment</button>
+            {% if researcher_nav %}
             <button class="btn btn-ghost" onclick="trainModel()">Retrain Model (Admin)</button>
+            {% endif %}
         </div>
     </div>
 </div>
@@ -295,16 +308,24 @@ function getCustomProfession() {
 }
 
 // ── Photo check (called right after photo loads) ──
+let photoCheckInProgress = false;
+
+function setPhotoCheckStatus(active) {
+    photoCheckInProgress = active;
+    document.getElementById('photoCheckStatus').classList.toggle('hidden', !active);
+}
+
 async function checkPhoto(imagePath) {
     const profession = getProfession();
     const customProfession = getCustomProfession();
     hideModerationWarning();
+    setPhotoCheckStatus(true);
 
     try {
         const res = await fetch('/check_photo', {
             method: 'POST',
             headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCsrfToken()},
-            body: JSON.stringify({ image_path: imagePath, profession, custom_profession: customProfession })
+            body: JSON.stringify({ image_path: imagePath, profession, custom_profession: customProfession, mode: subjectMode })
         });
         const data = await res.json();
         if (data.status === 'UNAVAILABLE' || !res.ok) {
@@ -319,11 +340,104 @@ async function checkPhoto(imagePath) {
                 clearImage();
             }
             showModerationWarning(data.issue, data.reason, data.no_face_category);
+            handlePhotoAttempts(data);
+        } else if (subjectMode === 'private') {
+            showAttemptsLeft(null);
         }
     } catch(e) {
         showToast('Photo check error: ' + e.message, 'error');
+    } finally {
+        setPhotoCheckStatus(false);
     }
 }
+
+// ── Private Participant: photo upload is locked until consent is given ──
+const PHOTO_MAX_ATTEMPTS = {{ private_photo_max_attempts }};
+let photoCooldownUntil = 0;
+let photoCooldownTimer = null;
+
+function photoCooldownLeft() {
+    return Math.max(0, Math.ceil((photoCooldownUntil - Date.now()) / 1000));
+}
+
+function isPhotoLocked() {
+    return subjectMode === 'private' && (!document.getElementById('privateConsent').checked || photoCooldownLeft() > 0);
+}
+
+function showAttemptsLeft(left) {
+    const note = document.getElementById('photoAttemptsNote');
+    if (left === null || left === undefined || left >= PHOTO_MAX_ATTEMPTS) { note.classList.add('hidden'); return; }
+    note.textContent = `⚠ Photo not accepted. You have ${left} more ${left === 1 ? 'try' : 'tries'} before a 1-minute wait.`;
+    note.classList.remove('hidden');
+}
+
+function startPhotoCooldown(seconds) {
+    if (!seconds || seconds <= 0) return;
+    photoCooldownUntil = Date.now() + seconds * 1000;
+    document.getElementById('photoAttemptsNote').classList.add('hidden');
+    const note = document.getElementById('photoCooldownNote');
+    const tick = () => {
+        const left = photoCooldownLeft();
+        if (left <= 0) {
+            clearInterval(photoCooldownTimer);
+            photoCooldownTimer = null;
+            note.classList.add('hidden');
+            updateConsentLock();
+            if (subjectMode === 'private') showToast('You can upload a photo again.', 'success');
+            return;
+        }
+        note.textContent = `⏳ Too many unsuccessful photos (${PHOTO_MAX_ATTEMPTS} tries). Please wait ${left}s before uploading again. Tip: use a clear, well-lit, front-facing photo of only you.`;
+        note.classList.remove('hidden');
+        updateConsentLock();
+    };
+    if (photoCooldownTimer) clearInterval(photoCooldownTimer);
+    tick();
+    photoCooldownTimer = setInterval(tick, 1000);
+}
+
+function handlePhotoAttempts(data) {
+    if (subjectMode !== 'private' || !data) return;
+    if (data.cooldown_seconds && data.cooldown_seconds > 0) {
+        startPhotoCooldown(data.cooldown_seconds);
+    } else if (data.attempts_left !== undefined) {
+        showAttemptsLeft(data.attempts_left);
+    }
+}
+
+function updateConsentLock() {
+    const locked = isPhotoLocked();
+    const noConsent = subjectMode === 'private' && !document.getElementById('privateConsent').checked;
+    document.getElementById('photoStepBlock').classList.toggle('photo-locked', locked);
+    document.getElementById('photoStepBlock').classList.toggle('photo-no-consent', noConsent);
+    document.getElementById('photoInput').disabled = locked;
+    const zone = document.getElementById('uploadZone');
+    zone.setAttribute('aria-disabled', locked ? 'true' : 'false');
+    zone.title = noConsent ? 'Tick the consent box in Step 1 first' : (locked ? 'Please wait before uploading again' : '');
+}
+
+function openPhotoPicker() {
+    if (isPhotoLocked()) {
+        if (photoCooldownLeft() > 0) {
+            showToast(`Please wait ${photoCooldownLeft()}s before uploading again.`, 'error');
+        } else {
+            showToast('Please tick the consent box in Step 1 first.', 'error');
+            document.getElementById('privateConsent').focus();
+        }
+        return;
+    }
+    document.getElementById('photoInput').click();
+}
+
+if ({{ private_photo_cooldown }} > 0) { startPhotoCooldown({{ private_photo_cooldown }}); }
+
+document.getElementById('privateConsent').addEventListener('change', function() {
+    // Unticking consent removes a photo that was already chosen
+    if (!this.checked && subjectMode === 'private' && (fetchedImagePath || document.getElementById('photoInput').files.length)) {
+        clearImage();
+        showToast('Photo removed because consent was unticked.', 'error');
+    }
+    updateConsentLock();
+});
 
 function showModerationWarning(issue, reason, category) {
     const w = document.getElementById('moderationWarning');
@@ -509,6 +623,12 @@ async function loadImageFromUrl() {
 }
 
 function previewPhoto(input) {
+    if (isPhotoLocked()) {
+        input.value = '';
+        showToast(photoCooldownLeft() > 0 ? `Please wait ${photoCooldownLeft()}s before uploading again.`
+                                          : 'Please tick the consent box in Step 1 first.', 'error');
+        return;
+    }
     const file = input.files[0];
     if (!file) return;
     const reader = new FileReader();
@@ -522,17 +642,24 @@ function previewPhoto(input) {
     // Upload immediately so the photo can be recognized and checked before submit.
     // The returned upload_id is reused by /check_photo and /analyze (no second upload).
     (async () => {
+        setPhotoCheckStatus(true);
         const fd = new FormData();
         fd.append('photo', file);
         let data;
         if (subjectMode === 'private') {
             // Private participants are never sent to celebrity recognition
             fd.append('skip_recognition', '1');
+            fd.append('consent', document.getElementById('privateConsent').checked ? 'true' : 'false');
             try {
                 const r = await fetch('/identify_photo', { method: 'POST', headers: {'X-CSRFToken': getCsrfToken()}, body: fd });
                 data = await r.json();
-                if (!r.ok || !data.success) { showToast('✗ ' + ((data && data.error) || 'Upload failed.'), 'error'); return; }
-            } catch (e) { showToast('Upload failed: ' + e.message, 'error'); return; }
+                if (!r.ok || !data.success) {
+                    setPhotoCheckStatus(false); clearImage();
+                    if (data && data.cooldown_seconds) startPhotoCooldown(data.cooldown_seconds);
+                    showToast('✗ ' + ((data && data.error) || 'Upload failed.'), 'error');
+                    return;
+                }
+            } catch (e) { setPhotoCheckStatus(false); showToast('Upload failed: ' + e.message, 'error'); return; }
         } else {
             data = await identifyPhoto(fd, true);
         }
@@ -541,6 +668,8 @@ function previewPhoto(input) {
         if (data && data.success && data.upload_id) {
             fetchedImagePath = data.upload_id;
             await checkPhoto(fetchedImagePath);
+        } else {
+            setPhotoCheckStatus(false);
         }
     })();
 }
@@ -580,6 +709,7 @@ function clearImage() {
     hideModerationWarning();
     hideAnalysisError();
     hideCelebrityInfo();
+    setPhotoCheckStatus(false);
     fetchedImagePath = null;
     fetchedImageB64 = null;
 }
@@ -638,6 +768,7 @@ async function paraphraseBio() {
 
 async function runValidateAndAnalyze() {
     if (isSubmitting) return;
+    if (photoCheckInProgress) { showToast('Please wait — the photo is still being checked.', 'error'); return; }
 
     const name = document.getElementById('nameInput').value.trim();
     const bio = document.getElementById('bioInput').value.trim();
@@ -697,6 +828,7 @@ async function runValidateAndAnalyze() {
         badge.classList.remove('hidden');
         document.getElementById('resultsPanel').style.display = 'block';
         document.getElementById('resultsName').textContent = name;
+        document.getElementById('resultsType').textContent = '';
 
         if (!valRes.ok || valData.status === 'UNAVAILABLE' || !valData.success) {
             badge.className = 'validation-badge mismatch';
@@ -965,6 +1097,7 @@ function setSubjectMode(mode) {
     hideAnalysisError();
     hideCelebrityInfo();
     switchImgTab(mode === 'private' ? 'upload' : 'url');
+    updateConsentLock();
 }
 
 function resetPrivateForm() {
@@ -981,6 +1114,7 @@ function resetPrivateForm() {
     if (btn) { btn.style.display = ''; btn.disabled = false; }
     const txt = document.getElementById('privateSubmitText');
     if (txt) txt.textContent = 'Analyze My Photo & Answers';
+    updateConsentLock();
 }
 
 function lockPrivateForm() {
@@ -994,6 +1128,7 @@ function lockPrivateForm() {
 async function runPrivateAnalyze() {
     if (isSubmitting) return;
     hideAnalysisError();
+    if (photoCheckInProgress) { showAnalysisError('Please wait — your photo is still being checked.'); return; }
 
     if (!document.getElementById('privateConsent').checked) {
         showAnalysisError('Please read and tick the consent box first.');
@@ -1041,6 +1176,7 @@ async function runPrivateAnalyze() {
             if (data.moderation_flag) { clearImage(); showModerationWarning('explicit_content', data.error); }
             else if (data.no_face) { clearImage(); showModerationWarning('no_face', data.error, data.no_face_category); }
             else if (data.ai_generated) { clearImage(); showModerationWarning('ai_generated', data.error); }
+            handlePhotoAttempts(data);
             showToast('✗ ' + data.error, 'error');
             showAnalysisError(data.error);
             btn.disabled = false;
@@ -1081,7 +1217,15 @@ function renderResults(data) {
     document.getElementById('bioSourceText').textContent = isQuestionnaire
         ? "Scores computed from the participant's own answers to the BFI-10 (10-item Big Five Inventory)"
         : 'Scores derived from biographical narrative using Claude AI personality psychology inference';
-    document.getElementById('resultsName').textContent = data.name;
+    const ptype = personalityType(data.biography_scores);
+    const typeEl = document.getElementById('resultsType');
+    if (isQuestionnaire) {
+        document.getElementById('resultsName').textContent = ptype.title;
+        typeEl.textContent = `Your personality type: ${ptype.summary}, based on your answers`;
+    } else {
+        document.getElementById('resultsName').textContent = data.name;
+        typeEl.textContent = `Personality type: ${ptype.title} (${ptype.summary})`;
+    }
     document.getElementById('resultsPanel').style.display = 'block';
     document.getElementById('bioReasoning').textContent = data.reasoning || '';
 
@@ -1094,7 +1238,7 @@ function renderResults(data) {
     renderTraits('bioTraits', data.biography_scores);
 
     if (data.has_estimation && data.estimated_scores) {
-        renderTraits('predTraits', data.estimated_scores);
+        renderTraits('predTraits', data.estimated_scores, true);
         document.getElementById('estTab').style.display = '';
         document.getElementById('corrTab').style.display = '';
 
@@ -1195,8 +1339,87 @@ function renderCorrelation(bioScores, faceScores) {
     `;
 }
 
-function renderTraits(containerId, scores) {
+// ── Plain-language explanations (layman terms) ──
+// Score bands: 0-35 low, 36-64 average, 65-100 high
+function scoreBand(v) { return v >= 65 ? 'high' : (v <= 35 ? 'low' : 'mid'); }
+
+const TRAIT_PLAIN = {
+    openness: {
+        high: '{S} {is} curious, creative, and open to new ideas. {S} {enjoys} imagination, art, and trying new things.',
+        mid:  '{S} {is} open to new ideas but also {likes} what is familiar, a balance of creativity and practicality.',
+        low:  '{S} {prefers} what is practical and familiar, and {likes} clear, proven ways of doing things over abstract ideas.'
+    },
+    conscientiousness: {
+        high: '{S} {is} organized, responsible, and hardworking, and {likes} to plan ahead and finish tasks properly.',
+        mid:  '{S} can be organized when it matters, but {is} also flexible and relaxed about some things.',
+        low:  '{S} {is} spontaneous and flexible, and may prefer going with the flow over strict plans and schedules.'
+    },
+    extraversion: {
+        high: '{S} {is} outgoing, talkative, and energized by being around people.',
+        mid:  '{S} {enjoys} socializing but also {values} quiet time, a mix of outgoing and reserved.',
+        low:  '{S} {is} quiet and reserved, and {prefers} small groups or time alone to recharge.'
+    },
+    agreeableness: {
+        high: '{S} {is} kind, trusting, and easy to get along with, and {cares} about keeping the peace.',
+        mid:  '{S} {is} generally cooperative but can stand firm when something really matters.',
+        low:  '{S} {is} direct and independent-minded, and {is} not afraid to disagree or challenge others.'
+    },
+    neuroticism: {
+        high: '{S} {feels} emotions strongly and may get stressed or worried more easily than most people.',
+        mid:  '{S} {feels} stress sometimes, like most people, but usually {handles} it well.',
+        low:  '{S} {is} calm and emotionally steady, and usually {stays} relaxed under pressure.'
+    }
+};
+
+const VERB_FORMS = {
+    is: ['are', 'is'], enjoys: ['enjoy', 'enjoys'], likes: ['like', 'likes'], prefers: ['prefer', 'prefers'],
+    values: ['value', 'values'], cares: ['care', 'cares'], feels: ['feel', 'feels'], handles: ['handle', 'handles'],
+    stays: ['stay', 'stays']
+};
+
+function plainExplanation(trait, value, subject) {
+    // subject = null for "You", otherwise a display name (third person)
+    const second = !subject;
+    let text = TRAIT_PLAIN[trait][scoreBand(value)];
+    text = text.replace(/\{S\}/g, second ? 'You' : subject);
+    text = text.replace(/\{(\w+)\}/g, (m, v) => VERB_FORMS[v] ? VERB_FORMS[v][second ? 0 : 1] : m);
+    return text;
+}
+
+// Personality "result name" based on the strongest trait (furthest from the average of 50)
+const PERSONALITY_TYPES = {
+    openness:          { high: ['The Creative Explorer', 'curious'],       low: ['The Practical Realist', 'practical'] },
+    conscientiousness: { high: ['The Reliable Organizer', 'organized'],    low: ['The Free Spirit', 'spontaneous'] },
+    extraversion:      { high: ['The Social Energizer', 'outgoing'],       low: ['The Quiet Thinker', 'reserved'] },
+    agreeableness:     { high: ['The Caring Harmonizer', 'caring'],        low: ['The Independent Challenger', 'independent'] },
+    neuroticism:       { high: ['The Sensitive Feeler', 'sensitive'],      low: ['The Calm Anchor', 'calm'] }
+};
+
+function personalityType(scores) {
+    const ranked = Object.keys(PERSONALITY_TYPES)
+        .filter(t => scores[t] !== undefined && scoreBand(scores[t]) !== 'mid')
+        .sort((a, b) => Math.abs(scores[b] - 50) - Math.abs(scores[a] - 50));
+    if (!ranked.length) {
+        return { title: 'The Balanced All-Rounder', summary: 'balanced across all five traits' };
+    }
+    const pick = t => PERSONALITY_TYPES[t][scores[t] >= 65 ? 'high' : 'low'];
+    const words = ranked.slice(0, 2).map(t => pick(t)[1]);
+    return { title: pick(ranked[0])[0], summary: 'mostly ' + words.join(' and ') };
+}
+
+function resultSubjectName() {
+    // "You" for private participants; first name for public figures
+    if (!lastResultData || lastResultData.score_source === 'BFI-10') return null;
+    const first = String(lastResultData.name || '').trim().split(/\s+/)[0];
+    return first || 'This person';
+}
+
+function renderTraits(containerId, scores, isFaceEstimate) {
     const container = document.getElementById(containerId);
+    const subject = resultSubjectName();
+    const prefix = isFaceEstimate
+        ? 'Face-based guess: '
+        : (lastResultData && lastResultData.score_source === 'BFI-10' ? 'Based on your answers: ' : 'Based on the biography: ');
     container.innerHTML = Object.entries(scores).map(([trait, val]) => `
         <div class="trait-row">
             <div class="trait-meta">
@@ -1206,7 +1429,8 @@ function renderTraits(containerId, scores) {
             <div class="trait-bar-wrap">
                 <div class="trait-bar" style="--w:${val}%;--c:${OCEAN_COLORS[trait]}"></div>
             </div>
-            <div class="trait-val" style="color:${OCEAN_COLORS[trait]}">${Math.round(val)}</div>
+            <div class="trait-val" style="color:${OCEAN_COLORS[trait]}">${Math.round(val)}${isFaceEstimate ? '<span class="trait-val-max"> / 100</span>' : ''}</div>
+            <div class="trait-explain"><span class="trait-explain-prefix">${prefix}</span>${escapeHtml(plainExplanation(trait, val, subject))}</div>
         </div>`).join('');
 }
 

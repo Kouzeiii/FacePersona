@@ -6,6 +6,8 @@ import base64
 import secrets
 import hmac
 import hashlib
+import time
+from concurrent.futures import ThreadPoolExecutor
 import socket
 import ipaddress
 import http.client
@@ -31,26 +33,6 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from scipy.stats import pearsonr
 import anthropic
-
-# Render runtime diagnostic: logs only package metadata, never credentials.
-def _log_opencv_runtime():
-    from importlib.metadata import PackageNotFoundError, version
-    import sys
-    print(f"[OPENCV CHECK] Python: {sys.version.split()[0]}", flush=True)
-    print(f"[OPENCV CHECK] cv2 path: {getattr(cv2, '__file__', None)}", flush=True)
-    print(f"[OPENCV CHECK] cv2 version: {getattr(cv2, '__version__', None)}", flush=True)
-    print(f"[OPENCV CHECK] CascadeClassifier available: {hasattr(cv2, 'CascadeClassifier')}", flush=True)
-    print(f"[OPENCV CHECK] HOGDescriptor available: {hasattr(cv2, 'HOGDescriptor')}", flush=True)
-    print(f"[OPENCV CHECK] Cascade data available: {hasattr(cv2, 'data')}", flush=True)
-    for package in ('opencv-python', 'opencv-python-headless',
-                    'opencv-contrib-python', 'opencv-contrib-python-headless'):
-        try:
-            print(f"[OPENCV CHECK] Installed {package}: {version(package)}", flush=True)
-        except PackageNotFoundError:
-            pass
-
-
-_log_opencv_runtime()
 
 # ── Environment & Configuration ──
 
@@ -252,6 +234,44 @@ BFI10_ITEMS = [
     ("has an active imagination", 'openness', False),
 ]
 BFI10_SCALE = ["Disagree strongly", "Disagree a little", "Neutral", "Agree a little", "Agree strongly"]
+
+
+# Private participants get a limited number of unsuccessful photo attempts before a short wait
+PRIVATE_PHOTO_MAX_ATTEMPTS = 3
+PRIVATE_PHOTO_COOLDOWN_SECONDS = 60
+
+
+def private_photo_cooldown_remaining():
+    """Seconds left in this session's photo cooldown (0 if none)."""
+    try:
+        until = float(session.get('pp_cooldown_until') or 0)
+    except (TypeError, ValueError):
+        until = 0.0
+    remaining = until - time.time()
+    return int(remaining) + (1 if remaining % 1 else 0) if remaining > 0 else 0
+
+
+def record_private_photo_failure():
+    """Count one rejected photo. After PRIVATE_PHOTO_MAX_ATTEMPTS failures, start the cooldown.
+    Returns (attempts_left, cooldown_seconds)."""
+    if private_photo_cooldown_remaining() > 0:
+        return 0, private_photo_cooldown_remaining()
+    failures = int(session.get('pp_failures') or 0) + 1
+    if failures >= PRIVATE_PHOTO_MAX_ATTEMPTS:
+        session['pp_failures'] = 0
+        session['pp_cooldown_until'] = time.time() + PRIVATE_PHOTO_COOLDOWN_SECONDS
+        return 0, PRIVATE_PHOTO_COOLDOWN_SECONDS
+    session['pp_failures'] = failures
+    return PRIVATE_PHOTO_MAX_ATTEMPTS - failures, 0
+
+
+def photo_attempt_info():
+    left, wait = record_private_photo_failure()
+    return {'attempts_left': left, 'cooldown_seconds': wait, 'max_attempts': PRIVATE_PHOTO_MAX_ATTEMPTS}
+
+
+def reset_private_photo_failures():
+    session['pp_failures'] = 0
 
 
 def get_private_participants_file():
@@ -1272,20 +1292,69 @@ def get_model_outdated_status():
 
 # ── Content Moderation & Facial Feature Extraction ──
 
+# ── Image encoding for Claude Vision (downscaled for speed) ──
+CLAUDE_IMAGE_MAX_SIDE = 1024
+CLAUDE_IMAGE_KEEP_RAW_BYTES = 1_000_000
+
+
+def encode_image_for_claude(image_path, max_side=CLAUDE_IMAGE_MAX_SIDE):
+    """Return (media_type, base64_data) for Claude Vision.
+    Large or unsupported images (e.g. BMP) are resized so the longest side is at most `max_side`
+    and re-encoded as JPEG. Smaller uploads are much faster to send and analyze, with the same result."""
+    ext = image_path.rsplit('.', 1)[-1].lower()
+    with open(image_path, 'rb') as f:
+        raw = f.read()
+    native = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'webp': 'image/webp'}
+    img = cv2.imread(image_path)
+    if img is not None:
+        h, w = img.shape[:2]
+        if ext not in native or max(h, w) > max_side or len(raw) > CLAUDE_IMAGE_KEEP_RAW_BYTES:
+            scale = min(1.0, max_side / float(max(h, w)))
+            if scale < 1.0:
+                img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+            if ok:
+                return 'image/jpeg', base64.b64encode(buf.tobytes()).decode('utf-8')
+    return native.get(ext, 'image/jpeg'), base64.b64encode(raw).decode('utf-8')
+
+
+def image_digest(image_path):
+    try:
+        with open(image_path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return None
+
+
+# Images whose explicit-content check already passed in /check_photo (keyed by content hash),
+# so /analyze does not repeat the same moderation call for the same photo.
+_MODERATION_PASSED = {}
+_MODERATION_PASSED_LOCK = threading.Lock()
+
+
+def remember_moderation_passed(digest):
+    if not digest:
+        return
+    with _MODERATION_PASSED_LOCK:
+        if len(_MODERATION_PASSED) >= 512:
+            _MODERATION_PASSED.pop(next(iter(_MODERATION_PASSED)))
+        _MODERATION_PASSED[digest] = True
+
+
+def moderation_already_passed(image_path):
+    digest = image_digest(image_path)
+    with _MODERATION_PASSED_LOCK:
+        return bool(digest and _MODERATION_PASSED.get(digest))
+
+
 def moderate_image(image_path, profession='other'):
     """Check image for inappropriate content using Claude Vision.
     Context-aware: allows swimwear for models/athletes, etc.
     Returns (is_safe, reason)."""
+    if moderation_already_passed(image_path):
+        return True, "Already passed the photo check.", 'PASSED'
     try:
-        with open(image_path, 'rb') as f:
-            image_data = f.read()
-        ext = image_path.rsplit('.', 1)[-1].lower()
-        media_type_map = {
-            'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
-            'png': 'image/png', 'webp': 'image/webp', 'bmp': 'image/bmp'
-        }
-        media_type = media_type_map.get(ext, 'image/jpeg')
-        b64_image = base64.b64encode(image_data).decode('utf-8')
+        media_type, b64_image = encode_image_for_claude(image_path)
 
         profession_contexts = {
             'model':       'This subject is a professional model, so swimwear, lingerie, and fashion editorial photos are acceptable.',
@@ -1519,11 +1588,7 @@ def detect_ai_metadata(image_path):
 def assess_ai_generated_via_claude(image_path):
     """Ask Claude Vision to classify the image as a real photograph vs AI-generated / digital art.
     Returns (is_ai, confidence_0_100, reason, classification) or raises on service errors."""
-    with open(image_path, 'rb') as f:
-        image_data = f.read()
-    ext = image_path.rsplit('.', 1)[-1].lower()
-    media_type = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-                  'webp': 'image/webp', 'bmp': 'image/bmp'}.get(ext, 'image/jpeg')
+    media_type, b64_data = encode_image_for_claude(image_path)
     client = get_claude_client()
     message = call_claude_messages_create(
         client,
@@ -1532,8 +1597,7 @@ def assess_ai_generated_via_claude(image_path):
         messages=[{
             "role": "user",
             "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type,
-                                             "data": base64.b64encode(image_data).decode('utf-8')}},
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64_data}},
                 {"type": "text", "text": """You are screening images for an academic research system that only accepts REAL camera photographs of people.
 
 Classify this image into exactly one category:
@@ -1637,11 +1701,7 @@ def explain_missing_face(image_path):
     too small, no person) so the user gets a specific message. Falls back to the generic message.
     Returns (category, message)."""
     try:
-        with open(image_path, 'rb') as f:
-            image_data = f.read()
-        ext = image_path.rsplit('.', 1)[-1].lower()
-        media_type = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-                      'webp': 'image/webp', 'bmp': 'image/bmp'}.get(ext, 'image/jpeg')
+        media_type, b64_data = encode_image_for_claude(image_path)
         client = get_claude_client()
         message = call_claude_messages_create(
             client,
@@ -1650,8 +1710,7 @@ def explain_missing_face(image_path):
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type,
-                                                 "data": base64.b64encode(image_data).decode('utf-8')}},
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64_data}},
                     {"type": "text", "text": """A face detector found no visible human face in this image. Pick the single best explanation:
 - "covered": a person is present but their face is covered or replaced (mask, helmet, costume head, face fully hidden)
 - "turned_away": a person is present but facing away or in strict profile
@@ -1673,29 +1732,6 @@ Respond ONLY with valid JSON (no markdown): {"category": "<one of the values abo
 
 
 # ── Face quality screening (blur, multiple people, obscured faces) ──
-
-class OpenCVConfigurationError(RuntimeError):
-    """Indicates that this server cannot load the OpenCV face detector."""
-
-
-def load_face_cascade():
-    """Use the existing Haar detector, but report missing OpenCV bindings clearly."""
-    if not hasattr(cv2, 'CascadeClassifier'):
-        raise OpenCVConfigurationError(
-            'OpenCV runtime is incomplete: cv2.CascadeClassifier is missing. '
-            'Inspect the [OPENCV CHECK] entries in the Render logs.'
-        )
-    cascade_dir = getattr(getattr(cv2, 'data', None), 'haarcascades', None)
-    if not cascade_dir:
-        raise OpenCVConfigurationError('OpenCV Haar cascade data directory is missing.')
-    cascade_path = os.path.join(cascade_dir, 'haarcascade_frontalface_default.xml')
-    if not os.path.isfile(cascade_path):
-        raise OpenCVConfigurationError('OpenCV Haar cascade XML file is missing.')
-    detector = cv2.CascadeClassifier(cascade_path)
-    if detector.empty():
-        raise OpenCVConfigurationError('OpenCV failed to initialize the Haar face detector.')
-    return detector
-
 FACE_BLUR_HARD_MIN = 25.0  # Laplacian variance of the 128x128 face crop; real photos are almost always far above this
 FACE_QUALITY_MESSAGES = {
     'blurred': ("The face in this photo is too blurry or distorted (e.g. motion blur or artistic effect). "
@@ -1716,7 +1752,7 @@ def measure_face_sharpness(image_path):
     if img is None:
         return None
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    face_cascade = load_face_cascade()
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
     if len(faces) == 0:
         return None
@@ -1740,9 +1776,7 @@ def check_face_quality(image_path):
         with _FACE_QUALITY_CACHE_LOCK:
             if digest in _FACE_QUALITY_CACHE:
                 return _FACE_QUALITY_CACHE[digest]
-        ext = image_path.rsplit('.', 1)[-1].lower()
-        media_type = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-                      'webp': 'image/webp', 'bmp': 'image/bmp'}.get(ext, 'image/jpeg')
+        media_type, b64_data = encode_image_for_claude(image_path)
         client = get_claude_client()
         message = call_claude_messages_create(
             client,
@@ -1751,8 +1785,7 @@ def check_face_quality(image_path):
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type,
-                                                 "data": base64.b64encode(image_data).decode('utf-8')}},
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64_data}},
                     {"type": "text", "text": """This photo will be used for facial feature analysis of ONE person. Judge only whether the face is usable:
 - "ok": one real person's face is clearly visible and reasonably sharp (normal lighting/compression/slight softness is fine; small background people are fine)
 - "blurred": the main face is heavily blurred, smeared, motion-blurred, or distorted so facial features cannot be made out
@@ -1787,7 +1820,7 @@ def detect_face_present(image_path):
     if img is None:
         return False
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    face_cascade = load_face_cascade()
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
     return len(faces) > 0
 
@@ -1842,7 +1875,7 @@ def get_response_quality_flags(answers, duration_seconds=None):
     if contradictions >= 3:
         flags.append(f'Inconsistent answers on {contradictions} of 5 traits')
     if duration_seconds is not None and duration_seconds < QUESTIONNAIRE_MIN_SECONDS:
-        flags.append(f'Completed in {duration_seconds:.0f}s (under {QUESTIONNAIRE_MIN_SECONDS}s)')
+        flags.append(f'Completed in {duration_seconds:.1f}s (under {QUESTIONNAIRE_MIN_SECONDS}s)')
     return flags
 
 
@@ -1858,7 +1891,7 @@ def extract_face_embedding(image_path):
         if img is None:
             return None, None, "Could not read image file."
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        face_cascade = load_face_cascade()
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
 
         # Reject image immediately if no face is detected
@@ -2675,6 +2708,209 @@ def researcher_participants():
                            ocean_letters=OCEAN_LETTERS, messages=get_flashed_messages(with_categories=True))
 
 
+
+# ── Per-subject computation breakdown (researcher-only) ──
+
+TRAIT_BAND_HIGH = 65
+TRAIT_BAND_LOW = 35
+PERSONALITY_TYPE_NAMES = {
+    'openness':          {'high': ('The Creative Explorer', 'curious'),    'low': ('The Practical Realist', 'practical')},
+    'conscientiousness': {'high': ('The Reliable Organizer', 'organized'), 'low': ('The Free Spirit', 'spontaneous')},
+    'extraversion':      {'high': ('The Social Energizer', 'outgoing'),    'low': ('The Quiet Thinker', 'reserved')},
+    'agreeableness':     {'high': ('The Caring Harmonizer', 'caring'),     'low': ('The Independent Challenger', 'independent')},
+    'neuroticism':       {'high': ('The Sensitive Feeler', 'sensitive'),   'low': ('The Calm Anchor', 'calm')},
+}
+
+
+def score_band(v):
+    if v is None:
+        return None
+    return 'high' if v >= TRAIT_BAND_HIGH else ('low' if v <= TRAIT_BAND_LOW else 'average')
+
+
+def explain_personality_type(scores):
+    """Same rule as the results page: the strongest trait (furthest from 50, outside the average band)."""
+    rows = []
+    for t in TRAIT_NAMES:
+        v = scores.get(t)
+        if v is None:
+            continue
+        rows.append({'trait': t, 'score': round(float(v), 1), 'distance': round(abs(float(v) - 50), 1),
+                     'band': score_band(float(v))})
+    eligible = sorted([r for r in rows if r['band'] != 'average'], key=lambda r: -r['distance'])
+    if not eligible:
+        return {'rows': rows, 'title': 'The Balanced All-Rounder', 'summary': 'balanced across all five traits', 'winner': None}
+    pick = lambda r: PERSONALITY_TYPE_NAMES[r['trait']][r['band']]
+    return {'rows': rows, 'title': pick(eligible[0])[0], 'winner': eligible[0]['trait'],
+            'summary': 'mostly ' + ' and '.join(pick(r)[1] for r in eligible[:2])}
+
+
+def explain_bfi10(answers):
+    """Step-by-step BFI-10 scoring for display."""
+    items = []
+    for i, ((text, trait, reverse), a) in enumerate(zip(BFI10_ITEMS, answers), start=1):
+        items.append({'num': i, 'text': text, 'trait': trait, 'answer': a, 'reverse': reverse,
+                      'scored': (6 - a) if reverse else a})
+    traits = []
+    for t in TRAIT_NAMES:
+        its = [it for it in items if it['trait'] == t]
+        mean = sum(it['scored'] for it in its) / len(its)
+        traits.append({'trait': t, 'items': its, 'mean': round(mean, 2), 'score': round((mean - 1) / 4 * 100, 1)})
+    return {'items': items, 'traits': traits}
+
+
+def explain_face_prediction(embedding):
+    """Recompute the face-based prediction step by step with the trained pipeline:
+    HOG vector -> StandardScaler -> PCA (10 components) -> 200 Random Forest trees -> average."""
+    if not os.path.exists(TRAINED_MODEL_FILE):
+        return None, "No trained model found."
+    try:
+        pipeline = joblib.load(TRAINED_MODEL_FILE)
+        scaler = pipeline.named_steps['scaler']
+        pca = pipeline.named_steps['pca']
+        rf = pipeline.named_steps['rf']
+        x = np.array(embedding, dtype=float).reshape(1, -1)
+        x_scaled = scaler.transform(x)
+        x_pca = pca.transform(x_scaled)
+        tree_preds = np.array([tree.predict(x_pca)[0] for tree in rf.estimators_])  # (n_trees, 5)
+        final = tree_preds.mean(axis=0)
+        sample_idx = list(range(5))
+        result = {
+            'hog': {
+                'length': int(x.shape[1]),
+                'norm': round(float(np.linalg.norm(x)), 4),
+                'min': round(float(x.min()), 4), 'max': round(float(x.max()), 4),
+                'mean': round(float(x.mean()), 4),
+                'first_values': [round(float(v), 4) for v in x[0, :10]],
+            },
+            'scaling': [{'feature': f'face_{i + 1}', 'raw': round(float(x[0, i]), 4),
+                         'mean': round(float(scaler.mean_[i]), 4), 'std': round(float(scaler.scale_[i]), 4),
+                         'scaled': round(float(x_scaled[0, i]), 3)} for i in sample_idx],
+            'pca': [{'component': f'PC{i + 1}', 'value': round(float(v), 3),
+                     'variance': round(float(pca.explained_variance_ratio_[i]) * 100, 2)}
+                    for i, v in enumerate(x_pca[0])],
+            'pca_total_variance': round(float(pca.explained_variance_ratio_.sum()) * 100, 2),
+            'n_trees': len(rf.estimators_),
+            'max_depth': rf.max_depth,
+            'trees': [{'trait': t,
+                       'min': round(float(tree_preds[:, j].min()), 1),
+                       'median': round(float(np.median(tree_preds[:, j])), 1),
+                       'max': round(float(tree_preds[:, j].max()), 1),
+                       'std': round(float(tree_preds[:, j].std()), 1),
+                       'final': round(float(final[j]), 1),
+                       'examples': [round(float(v), 1) for v in tree_preds[:3, j]]}
+                      for j, t in enumerate(TRAIT_NAMES)],
+            'final': {t: round(float(final[j]), 1) for j, t in enumerate(TRAIT_NAMES)},
+        }
+        return result, None
+    except Exception as e:
+        return None, str(e)
+
+
+def alignment_label(diff):
+    if diff <= 10:
+        return 'High Agreement'
+    if diff <= 20:
+        return 'Moderate Agreement'
+    if diff <= 35:
+        return 'Low Agreement'
+    return 'Divergent'
+
+
+@app.route('/researcher/computation')
+def researcher_computation():
+    """Researcher-only, per-subject explanation of how the OCEAN results were computed."""
+    if not is_researcher():
+        return researcher_login_redirect()
+    kind = request.args.get('type', 'subject')
+    ident = str(request.args.get('id', '')).strip()
+    if not ident:
+        return redirect(url_for('subjects'))
+
+    ctx = {'kind': kind, 'ident': ident, 'trait_names': TRAIT_NAMES, 'trait_labels': TRAIT_LABELS,
+           'ocean_letters': OCEAN_LETTERS, 'band_high': TRAIT_BAND_HIGH, 'band_low': TRAIT_BAND_LOW,
+           'error': None, 'bfi': None, 'claude': None, 'face': None, 'face_error': None, 'meta': {}}
+    reference, embedding, stored_pred = None, None, None
+
+    if kind == 'private':
+        df = load_private_participants()
+        match = df[df['participant_id'].astype(str).str.upper() == ident.upper()] if not df.empty else df
+        if match.empty:
+            ctx['error'] = f"Participant {ident} not found."
+            return render_template('computation.html', **ctx)
+        row = match.iloc[0]
+        try:
+            answers = [int(a) for a in str(row.get('bfi10_answers', '')).split()]
+        except ValueError:
+            answers = []
+        if len(answers) == len(BFI10_ITEMS):
+            ctx['bfi'] = explain_bfi10(answers)
+        reference = {t: float(row[t]) for t in TRAIT_NAMES}
+        face_cols = [f'face_{i}' for i in range(1, 513)]
+        if all(c in row.index for c in face_cols):
+            embedding = [float(row[c]) for c in face_cols]
+        stored_pred = {t: (None if pd.isna(row.get(f'pred_{t}')) else float(row.get(f'pred_{t}'))) for t in TRAIT_NAMES}
+        ctx['meta'] = {'title': ident, 'subtitle': 'Private participant · scores from BFI-10 questionnaire',
+                       'age_range': row.get('age_range'), 'date': str(row.get('consent_timestamp') or '')[:10]}
+    else:
+        profile = load_profile(ident)
+        if not profile:
+            ctx['error'] = f"Subject {ident} not found."
+            return render_template('computation.html', **ctx)
+        reference = {t: float(profile['biography_scores'][t]) for t in TRAIT_NAMES
+                     if t in (profile.get('biography_scores') or {})}
+        is_base = is_baseline_subject(ident)
+        ctx['claude'] = {'reasoning': profile.get('reasoning') or '',
+                         'profession': profile.get('profession_label') or profile.get('profession') or ''}
+        ctx['meta'] = {'title': profile.get('name') or ident,
+                       'subtitle': ('Research baseline subject' if is_base else 'Public assessment') +
+                                   ' · scores from biography (Claude AI)'}
+        # Embedding: baseline CSV first, otherwise re-extract from the saved photo
+        if os.path.exists(FACE_EMBEDDINGS_FILE):
+            fe = pd.read_csv(FACE_EMBEDDINGS_FILE)
+            m = fe[fe['name'] == ident]
+            if not m.empty:
+                embedding = m.iloc[0][[f'face_{i}' for i in range(1, 513)]].astype(float).tolist()
+        if embedding is None:
+            image_name = profile.get('image_filename')
+            if not image_name and os.path.exists(PUBLIC_ASSESSMENTS_FILE):
+                pa = pd.read_csv(PUBLIC_ASSESSMENTS_FILE)
+                m = pa[pa['name'] == ident]
+                if not m.empty and not pd.isna(m.iloc[0].get('image_filename')):
+                    image_name = str(m.iloc[0]['image_filename'])
+            if image_name:
+                img_path, err = validate_and_resolve_upload_path(image_name)
+                if img_path:
+                    embedding, _, _ = extract_face_embedding(img_path)
+        est = profile.get('estimated_scores') or {}
+        stored_pred = {t: est.get(t) for t in TRAIT_NAMES} if est else None
+
+    if embedding is not None:
+        ctx['face'], ctx['face_error'] = explain_face_prediction(embedding)
+    else:
+        ctx['face_error'] = "No facial features available for this subject (photo not found)."
+
+    ctx['reference'] = reference
+    ctx['ptype'] = explain_personality_type(reference) if reference else None
+    comparison = []
+    if reference and ctx['face']:
+        for t in TRAIT_NAMES:
+            if t in reference:
+                diff = abs(reference[t] - ctx['face']['final'][t])
+                comparison.append({'trait': t, 'reference': round(reference[t], 1), 'predicted': ctx['face']['final'][t],
+                                   'diff': round(diff, 1), 'label': alignment_label(diff)})
+    ctx['comparison'] = comparison
+    ctx['stored_pred'] = stored_pred
+    metrics = None
+    if os.path.exists(MODEL_METRICS_FILE):
+        try:
+            with open(MODEL_METRICS_FILE, 'r', encoding='utf-8') as f:
+                metrics = json.load(f)
+        except Exception:
+            metrics = None
+    ctx['trait_metrics'] = (metrics or {}).get('trait_metrics') or {}
+    return render_template('computation.html', **ctx)
+
 @app.route('/researcher/participants/delete', methods=['POST'])
 def researcher_delete_participant():
     if not is_researcher():
@@ -2752,6 +2988,8 @@ def analyze():
                                min_biography_words=MIN_BIOGRAPHY_WORDS,
                                bfi10_items=[item[0] for item in BFI10_ITEMS],
                                bfi10_scale=BFI10_SCALE,
+                               private_photo_cooldown=private_photo_cooldown_remaining(),
+                               private_photo_max_attempts=PRIVATE_PHOTO_MAX_ATTEMPTS,
                                private_age_ranges=PRIVATE_AGE_RANGES,
                                private_background_max=PRIVATE_BACKGROUND_MAX_CHARS)
 
@@ -3111,14 +3349,14 @@ def analyze_private():
         return jsonify({'success': False, 'status': 'UNAVAILABLE', 'error': f'Content moderation unavailable: {mod_reason}'}), 503
     if not is_safe:
         cleanup_ephemeral_file(ephemeral_file_path)
-        return jsonify({'success': False, 'status': 'FAILED', 'moderation_flag': True,
+        return jsonify({**photo_attempt_info(), 'success': False, 'status': 'FAILED', 'moderation_flag': True,
                         'error': f'Inappropriate image detected: {mod_reason} Please upload a proper photo.'}), 400
 
     # AI-generated screening
     ai_res = check_ai_generated_image(photo_path)
     if ai_res['is_ai']:
         cleanup_ephemeral_file(ephemeral_file_path)
-        return jsonify({'success': False, 'status': 'FAILED', 'ai_generated': True,
+        return jsonify({**photo_attempt_info(), 'success': False, 'status': 'FAILED', 'ai_generated': True,
                         'error': f"AI-generated image detected: {ai_res['reason']} Please use a real photograph."}), 400
 
     # Facial features
@@ -3127,7 +3365,7 @@ def analyze_private():
         if err.startswith("No face detected"):
             category, no_face_msg = explain_missing_face(photo_path)
             cleanup_ephemeral_file(ephemeral_file_path)
-            return jsonify({'success': False, 'error': no_face_msg, 'no_face': True, 'no_face_category': category}), 400
+            return jsonify({**photo_attempt_info(), 'success': False, 'error': no_face_msg, 'no_face': True, 'no_face_category': category}), 400
         cleanup_ephemeral_file(ephemeral_file_path)
         return jsonify({'success': False, 'error': err}), 400
     if not isinstance(embedding, list) or len(embedding) != 512 or not all(np.isfinite(x) for x in embedding):
@@ -3137,7 +3375,7 @@ def analyze_private():
     face_ok, face_category, face_msg = check_face_quality(photo_path)
     if not face_ok:
         cleanup_ephemeral_file(ephemeral_file_path)
-        return jsonify({'success': False, 'error': face_msg, 'no_face': True, 'no_face_category': face_category}), 400
+        return jsonify({**photo_attempt_info(), 'success': False, 'error': face_msg, 'no_face': True, 'no_face_category': face_category}), 400
 
     predicted, _ = estimate_personality(embedding)
     model_is_outdated, outdated_reason = get_model_outdated_status()
@@ -3251,31 +3489,37 @@ def check_photo():
         return jsonify({'success': False, 'ok': False, 'error': f'Invalid image reference: {err}', 'status': 'FAILED'}), 400
 
     try:
-        with open(safe_path, 'rb') as f:
-            image_data = f.read()
-        ext = safe_path.rsplit('.', 1)[-1].lower()
-        media_type_map = {
-            'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
-            'png': 'image/png', 'webp': 'image/webp', 'bmp': 'image/bmp'
-        }
-        media_type = media_type_map.get(ext, 'image/jpeg')
-        b64_image = base64.b64encode(image_data).decode('utf-8')
+        started = time.monotonic()
+        digest = image_digest(safe_path)
+        is_private = str(data.get('mode') or '').lower() == 'private'
 
-        client = get_claude_client()
-        message = call_claude_messages_create(
-            client,
-            HAIKU_MODEL_CANDIDATES,
-            max_tokens=300,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": media_type, "data": b64_image}
-                    },
-                    {
-                        "type": "text",
-                        "text": f"""You are a content moderator for an academic personality analysis system.
+        def fail(issue, reason, **extra):
+            payload = {'success': True, 'ok': False, 'status': 'FAILED', 'issue': issue, 'reason': reason}
+            payload.update(extra)
+            if is_private:
+                left, wait = record_private_photo_failure()
+                payload.update({'attempts_left': left, 'cooldown_seconds': wait,
+                                'max_attempts': PRIVATE_PHOTO_MAX_ATTEMPTS})
+            print(f"[PHOTO-CHECK] {os.path.basename(safe_path)}: {issue} in {time.monotonic() - started:.1f}s", flush=True)
+            return jsonify(payload)
+
+        def run_moderation():
+            media_type, b64_image = encode_image_for_claude(safe_path)
+            client = get_claude_client()
+            message = call_claude_messages_create(
+                client,
+                HAIKU_MODEL_CANDIDATES,
+                max_tokens=300,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": b64_image}
+                        },
+                        {
+                            "type": "text",
+                            "text": f"""You are a content moderator for an academic personality analysis system.
 
 The user selected profession category: "{display_profession}"
 
@@ -3290,11 +3534,24 @@ Check this image for TWO things:
 
 Respond ONLY with valid JSON (no markdown):
 {{"ok": true/false, "issue": "explicit_content" or "profession_mismatch" or null, "reason": "<one clear sentence explaining the issue, or null if ok>"}}"""
-                    }
-                ]
-            }]
-        )
-        data = extract_and_parse_json(message.content[0].text)
+                        }
+                    ]
+                }]
+            )
+            return extract_and_parse_json(message.content[0].text)
+
+        # 1. Fast local checks first (no API call): is there a face, and is it extremely blurred?
+        face_present = detect_face_present(safe_path)
+
+        # 2. Run the AI checks at the same time instead of one after another
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            fut_mod = pool.submit(run_moderation)
+            fut_ai = pool.submit(check_ai_generated_image, safe_path)
+            fut_face = pool.submit(check_face_quality if face_present else explain_missing_face, safe_path)
+            data = fut_mod.result()
+            ai_res = fut_ai.result()
+            face_res = fut_face.result()
+
         if 'ok' not in data:
             return jsonify({
                 'success': False,
@@ -3303,67 +3560,34 @@ Respond ONLY with valid JSON (no markdown):
                 'error': "Missing 'ok' property in photo check response."
             }), 502
 
+        # 3. Report the most serious problem first
         ok_val = parse_strict_boolean(data['ok'], 'ok')
         if not ok_val:
             issue_val = data.get('issue')
             if issue_val == 'explicit_content':
                 cleanup_ephemeral_file(safe_path)
-            return jsonify({
-                'success': True,
-                'ok': False,
-                'status': 'FAILED',
-                'issue': issue_val,
-                'reason': str(data.get('reason') or 'Photo is not appropriate.').strip()
-            })
+            return fail(issue_val, str(data.get('reason') or 'Photo is not appropriate.').strip())
+        remember_moderation_passed(digest)
 
-        # AI-generated image screening (metadata + vision)
-        ai_res = check_ai_generated_image(safe_path)
         if ai_res['is_ai']:
             cleanup_ephemeral_file(safe_path)
-            return jsonify({
-                'success': True,
-                'ok': False,
-                'status': 'FAILED',
-                'issue': 'ai_generated',
-                'detection_method': ai_res['method'],
-                'confidence': ai_res['confidence'],
-                'reason': f"{ai_res['reason']} Please use a real photograph of the subject."
-            })
+            return fail('ai_generated', f"{ai_res['reason']} Please use a real photograph of the subject.",
+                        detection_method=ai_res['method'], confidence=ai_res['confidence'])
 
-        # Early face visibility check (same detector used during analysis)
-        if not detect_face_present(safe_path):
-            category, no_face_msg = explain_missing_face(safe_path)
-            return jsonify({
-                'success': True,
-                'ok': False,
-                'status': 'FAILED',
-                'issue': 'no_face',
-                'no_face_category': category,
-                'reason': no_face_msg
-            })
+        if not face_present:
+            category, no_face_msg = face_res
+            return fail('no_face', no_face_msg, no_face_category=category)
 
-        face_ok, face_category, face_msg = check_face_quality(safe_path)
+        face_ok, face_category, face_msg = face_res
         if not face_ok:
-            return jsonify({
-                'success': True,
-                'ok': False,
-                'status': 'FAILED',
-                'issue': 'no_face',
-                'no_face_category': face_category,
-                'reason': face_msg
-            })
+            return fail('no_face', face_msg, no_face_category=face_category)
 
+        if is_private:
+            reset_private_photo_failures()
+        print(f"[PHOTO-CHECK] {os.path.basename(safe_path)}: passed in {time.monotonic() - started:.1f}s", flush=True)
         return jsonify({'success': True, 'ok': True, 'status': 'PASSED',
                         'ai_check_status': ai_res['status'],
                         'ai_check_error': ai_res['reason'] if ai_res['status'] == 'UNAVAILABLE' else None})
-    except OpenCVConfigurationError as e:
-        app.logger.exception('OpenCV face detection unavailable during /check_photo')
-        return jsonify({
-            'success': False,
-            'ok': False,
-            'status': 'UNAVAILABLE',
-            'error': 'Face detection service unavailable: OpenCV is not correctly installed on the server. Check Render logs.'
-        }), 503
     except (json.JSONDecodeError, ValueError) as e:
         return jsonify({
             'success': False,
@@ -3391,6 +3615,16 @@ def identify_photo():
     rl_err = check_ai_rate_limit('identify_photo', limit_per_minute=15)
     if rl_err:
         return rl_err
+
+    # Private participants must give consent before any photo is uploaded
+    if str(request.form.get('skip_recognition') or '').lower() in ('1', 'true') and \
+            str(request.form.get('consent') or '').lower() not in ('1', 'true'):
+        return jsonify({'success': False, 'error': 'Please tick the consent box before uploading your photo.'}), 400
+    if str(request.form.get('skip_recognition') or '').lower() in ('1', 'true'):
+        wait = private_photo_cooldown_remaining()
+        if wait > 0:
+            return jsonify({'success': False, 'cooldown_seconds': wait,
+                            'error': f'Too many unsuccessful photos. Please wait {wait} seconds before trying again.'}), 429
 
     photo = request.files.get('photo')
     upload_id = None

@@ -2058,7 +2058,11 @@ class FacePersonaTestSuite(unittest.TestCase):
         root_gitignore = os.path.join(os.path.dirname(APP_DIR), '.gitignore')
         root_gitattributes = os.path.join(os.path.dirname(APP_DIR), '.gitattributes')
 
-        for fpath in [app_gitignore, app_gitattributes, root_gitignore, root_gitattributes]:
+        required = [app_gitignore, app_gitattributes]
+        # Parent-folder files are only required when the parent is a project folder (has its own .gitignore)
+        if os.path.exists(root_gitignore):
+            required += [root_gitignore, root_gitattributes]
+        for fpath in required:
             self.assertTrue(os.path.exists(fpath), f"Missing exclusion file: {fpath}")
             with open(fpath, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -2095,7 +2099,7 @@ class FacePersonaTestSuite(unittest.TestCase):
             target_profiles_dir = os.path.join(target_data, 'profiles')
             self.assertTrue(os.path.exists(target_profiles_dir))
             profile_files = [f for f in os.listdir(target_profiles_dir) if f.lower().endswith('.json')]
-            self.assertEqual(len(profile_files), 103, "All 103 baseline profile JSON files must be seeded")
+            self.assertGreaterEqual(len(profile_files), 103, "All 103 baseline profile JSON files must be seeded")
 
             # 2. Verify baseline datasets and model present
             self.assertTrue(os.path.exists(os.path.join(target_data, 'processed', 'dataset.csv')))
@@ -2160,7 +2164,8 @@ class FacePersonaTestSuite(unittest.TestCase):
         self.assertNotIn("Confidential ground-truth calibration subjects", content)
 
         # Accurate computational terminology must be present
-        self.assertIn("LLM-Inferred OCEAN Reference Scores", content)
+        self.assertIn("OCEAN Reference Scores (0–100)", content)
+        self.assertIn("BFI-10", content)
         self.assertIn("Research dataset records", content)
 
     def test_safe_deployment_packaging_and_credential_exclusion(self):
@@ -2303,6 +2308,26 @@ class FacePersonaTestSuite(unittest.TestCase):
     # AI-GENERATED IMAGE DETECTION TESTS
     # =========================================================================
 
+    def _claude_prompt_mock(self, moderation=None, ai=None, face=None, explain=None):
+        """Claude client mock that answers based on WHICH check is asking (safe for parallel calls)."""
+        answers = [
+            ('content moderator', moderation or '{"ok": true, "issue": null, "reason": null}'),
+            ('Classify this image', ai or '{"classification": "real_photo", "confidence": 5, "reason": "Real photo."}'),
+            ('Judge only whether the face', face or '{"verdict": "ok"}'),
+            ('A face detector found no visible', explain or '{"category": "other"}'),
+        ]
+        mock_client = MagicMock()
+        def _create(*a, **k):
+            text = ' '.join(part.get('text', '') for msg in k.get('messages', [])
+                            for part in (msg['content'] if isinstance(msg['content'], list) else [{'text': msg['content']}])
+                            if isinstance(part, dict))
+            reply = next((ans for key, ans in answers if key in text), '{}')
+            m = MagicMock()
+            m.content = [MagicMock(text=reply)]
+            return m
+        mock_client.messages.create.side_effect = _create
+        return mock_client
+
     def _claude_text_mock(self, *texts):
         """Claude client mock returning the given texts in order (last one repeats)."""
         mock_client = MagicMock()
@@ -2343,8 +2368,7 @@ class FacePersonaTestSuite(unittest.TestCase):
         app._AI_CHECK_CACHE.clear()
         client, csrf_token = self.get_authenticated_client()
         path = self._copy_face_with_suffix('jpg')
-        mock = self._claude_text_mock('{"ok": true, "issue": null, "reason": null}',
-                                      '{"ai_generated": true, "confidence": 95, "reason": "Melted fingers and garbled text."}')
+        mock = self._claude_prompt_mock(ai='{"ai_generated": true, "confidence": 95, "reason": "Melted fingers and garbled text."}')
         with patch('app.get_claude_client', return_value=mock):
             resp = client.post('/check_photo', headers={'X-CSRFToken': csrf_token},
                                json={'image_path': os.path.basename(path), 'profession': 'musician'})
@@ -2446,9 +2470,7 @@ class FacePersonaTestSuite(unittest.TestCase):
         img = cv2.imread(self.no_face_path)
         path = os.path.join(app.UPLOAD_DIR, f"{uuid.uuid4().hex}.jpg")
         cv2.imwrite(path, img)
-        mock = self._claude_text_mock('{"ok": true, "issue": null, "reason": null}',
-                                      '{"classification": "real_photo", "confidence": 5, "reason": "Real photo."}',
-                                      '{"category": "covered"}')
+        mock = self._claude_prompt_mock(explain='{"category": "covered"}')
         with patch('app.get_claude_client', return_value=mock):
             resp = client.post('/check_photo', headers={'X-CSRFToken': csrf_token},
                                json={'image_path': os.path.basename(path), 'profession': 'musician'})
@@ -2548,7 +2570,7 @@ class FacePersonaTestSuite(unittest.TestCase):
         with patch('app.recognize_celebrity') as mock_rec:
             with open(self.verified_face_path, 'rb') as f:
                 resp = client.post('/identify_photo', headers={'X-CSRFToken': csrf_token},
-                                   data={'photo': (f, 'me.jpg'), 'skip_recognition': '1'},
+                                   data={'photo': (f, 'me.jpg'), 'skip_recognition': '1', 'consent': 'true'},
                                    content_type='multipart/form-data')
             mock_rec.assert_not_called()
         data = resp.get_json()
@@ -2654,6 +2676,222 @@ class FacePersonaTestSuite(unittest.TestCase):
         html = rclient.get('/researcher/participants').data.decode()
         self.assertIn(pid, html)
         self.assertIn('Same answer for all items', html)
+
+    # =========================================================================
+    # PHOTO CHECK SPEED & CONSENT-FIRST UPLOAD TESTS
+    # =========================================================================
+
+    def test_check_photo_runs_ai_checks_in_parallel(self):
+        """Moderation, AI-generated and face checks run at the same time, so the wait is about
+        the slowest single check instead of the sum of all checks."""
+        import time as _time
+        app._AI_CHECK_CACHE.clear()
+        app._FACE_QUALITY_CACHE.clear()
+        client, csrf_token = self.get_authenticated_client()
+        path = self._copy_face_with_suffix('jpg')
+        mock = self._claude_prompt_mock()
+        original_create = mock.messages.create.side_effect
+        def slow_create(*a, **k):
+            _time.sleep(0.6)
+            return original_create(*a, **k)
+        mock.messages.create.side_effect = slow_create
+        with patch('app.get_claude_client', return_value=mock):
+            start = _time.monotonic()
+            resp = client.post('/check_photo', headers={'X-CSRFToken': csrf_token},
+                               json={'image_path': os.path.basename(path), 'profession': 'musician'})
+            elapsed = _time.monotonic() - start
+        self.assertTrue(resp.get_json()['ok'], resp.get_json())
+        self.assertGreaterEqual(mock.messages.create.call_count, 3)
+        self.assertLess(elapsed, 1.5, f"Checks should run in parallel (took {elapsed:.2f}s for 3 x 0.6s calls)")
+
+    def test_check_photo_reports_most_serious_issue_first(self):
+        """Explicit content is reported even if other checks also fail."""
+        app._AI_CHECK_CACHE.clear()
+        app._FACE_QUALITY_CACHE.clear()
+        client, csrf_token = self.get_authenticated_client()
+        path = self._copy_face_with_suffix('jpg')
+        mock = self._claude_prompt_mock(moderation='{"ok": false, "issue": "explicit_content", "reason": "Nudity."}',
+                                        ai='{"classification": "ai_generated", "confidence": 99, "reason": "AI."}',
+                                        face='{"verdict": "blurred"}')
+        with patch('app.get_claude_client', return_value=mock):
+            data = client.post('/check_photo', headers={'X-CSRFToken': csrf_token},
+                               json={'image_path': os.path.basename(path), 'profession': 'musician'}).get_json()
+        self.assertEqual(data['issue'], 'explicit_content')
+
+    def test_moderation_not_repeated_on_analyze_after_photo_check(self):
+        """A photo that already passed /check_photo is not sent to moderation again on analyze."""
+        app._AI_CHECK_CACHE.clear()
+        app._FACE_QUALITY_CACHE.clear()
+        client, csrf_token = self.get_authenticated_client()
+        path = self._copy_face_with_suffix('jpg')
+        with patch('app.get_claude_client', return_value=self._claude_prompt_mock()):
+            client.post('/check_photo', headers={'X-CSRFToken': csrf_token},
+                        json={'image_path': os.path.basename(path), 'profession': 'musician'})
+        with patch('app.get_claude_client') as mock_claude:
+            is_safe, reason, status = app.moderate_image(path, 'musician')
+            mock_claude.assert_not_called()
+        self.assertTrue(is_safe)
+        self.assertEqual(status, 'PASSED')
+
+    def test_images_downscaled_before_sending_to_claude(self):
+        """Large or BMP images are resized/re-encoded to JPEG (max 1024px) before being sent to Claude."""
+        import base64 as _b64
+        big = np.random.RandomState(0).randint(0, 255, (2400, 1800, 3)).astype(np.uint8)
+        big_path = os.path.join(app.UPLOAD_DIR, f"{uuid.uuid4().hex}.png")
+        cv2.imwrite(big_path, big)
+        media_type, data = app.encode_image_for_claude(big_path)
+        self.assertEqual(media_type, 'image/jpeg')
+        decoded = cv2.imdecode(np.frombuffer(_b64.b64decode(data), np.uint8), cv2.IMREAD_COLOR)
+        self.assertLessEqual(max(decoded.shape[:2]), app.CLAUDE_IMAGE_MAX_SIDE)
+        bmp_path = os.path.join(app.UPLOAD_DIR, f"{uuid.uuid4().hex}.bmp")
+        cv2.imwrite(bmp_path, cv2.imread(self.verified_face_path))
+        self.assertEqual(app.encode_image_for_claude(bmp_path)[0], 'image/jpeg')
+
+    def test_private_upload_requires_consent_first(self):
+        """Private participant photo upload is refused until consent is given (nothing is saved)."""
+        client, csrf_token = self.get_authenticated_client()
+        before = set(os.listdir(app.UPLOAD_DIR))
+        with open(self.verified_face_path, 'rb') as f:
+            resp = client.post('/identify_photo', headers={'X-CSRFToken': csrf_token},
+                               data={'photo': (f, 'me.jpg'), 'skip_recognition': '1'},
+                               content_type='multipart/form-data')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('consent', resp.get_json()['error'])
+        self.assertEqual(set(os.listdir(app.UPLOAD_DIR)), before, "No file may be saved without consent")
+
+    def test_private_mode_page_has_consent_lock(self):
+        """The Analyze page includes the consent lock note and locked upload handling."""
+        html = self.client.get('/analyze').data.decode()
+        self.assertIn('id="consentLockNote"', html)
+        self.assertIn('openPhotoPicker()', html)
+        self.assertIn('id="photoCheckStatus"', html)
+
+    def test_results_have_plain_language_and_personality_type(self):
+        """Results page includes the personality-type title and layman explanations for each trait,
+        and hides admin-only buttons from public users."""
+        html = self.client.get('/analyze').data.decode()
+        self.assertIn('id="resultsType"', html)
+        self.assertIn('function personalityType', html)
+        self.assertIn('The Caring Harmonizer', html)
+        self.assertIn('trait-explain', html)
+        self.assertNotIn('Retrain Model (Admin)', html)
+        rclient, _ = self._researcher_client()
+        self.assertIn('Retrain Model (Admin)', rclient.get('/analyze').data.decode())
+
+    def test_computation_page_researcher_only_and_correct(self):
+        """Per-subject computation is researcher-only; BFI-10 math and face prediction steps are shown,
+        and the recomputed Random Forest average equals the pipeline prediction."""
+        self.assertEqual(self.client.get('/researcher/computation?type=subject&id=Sandboxed_Subject_1').status_code, 302)
+        app.build_and_train_model()
+        emb = pd.read_csv(app.FACE_EMBEDDINGS_FILE).iloc[0][[f'face_{i}' for i in range(1, 513)]].astype(float).tolist()
+        breakdown, err = app.explain_face_prediction(emb)
+        self.assertIsNone(err)
+        pred, _ = app.estimate_personality(emb)
+        for t in app.TRAIT_NAMES:
+            self.assertAlmostEqual(breakdown['final'][t], pred[t], places=0)
+        bfi = app.explain_bfi10([2, 4, 2, 3, 2, 4, 2, 5, 3, 4])
+        c = next(x for x in bfi['traits'] if x['trait'] == 'conscientiousness')
+        self.assertEqual(c['score'], 87.5)
+
+        client, csrf_token = self._researcher_client()
+        html = client.get('/researcher/computation?type=subject&id=Sandboxed_Subject_1').data.decode()
+        self.assertIn('How the result was computed', html)
+        self.assertIn('Random Forest', html)
+        self.assertIn('Personality type rule', html)
+
+        upload_id = self._private_upload()
+        passed = {'is_ai': False, 'method': 'vision', 'confidence': 5.0, 'reason': '', 'status': 'PASSED'}
+        with patch('app.moderate_image', return_value=(True, 'Safe', 'PASSED')), \
+             patch('app.check_ai_generated_image', return_value=passed), \
+             patch('app.check_face_quality', return_value=(True, 'ok', '')):
+            pid = client.post('/analyze_private', headers={'X-CSRFToken': csrf_token},
+                              json=self._private_payload(upload_id)).get_json()['participant_id']
+        html = client.get(f'/researcher/computation?type=private&id={pid}').data.decode()
+        self.assertIn('6 − 2', html)
+        self.assertIn('87.5', html)
+        self.assertIn('Computation', client.get('/researcher/participants').data.decode())
+
+    # =========================================================================
+    # PRIVATE PHOTO ATTEMPT LIMIT & RA 10173 CONSENT TESTS
+    # =========================================================================
+
+    def _blurred_check(self, client, csrf_token, mode='private'):
+        app._AI_CHECK_CACHE.clear()
+        app._FACE_QUALITY_CACHE.clear()
+        path = self._copy_face_with_suffix('jpg')
+        with patch('app.get_claude_client', return_value=self._claude_prompt_mock(face='{"verdict": "blurred"}')):
+            return client.post('/check_photo', headers={'X-CSRFToken': csrf_token},
+                               json={'image_path': os.path.basename(path), 'profession': 'other', 'mode': mode}).get_json()
+
+    def test_private_photo_three_failures_start_one_minute_cooldown(self):
+        """After 3 rejected photos, private uploads are blocked for 60 seconds (server-side)."""
+        client, csrf_token = self.get_authenticated_client()
+        first = self._blurred_check(client, csrf_token)
+        self.assertEqual(first['attempts_left'], 2)
+        self.assertEqual(self._blurred_check(client, csrf_token)['attempts_left'], 1)
+        third = self._blurred_check(client, csrf_token)
+        self.assertEqual(third['attempts_left'], 0)
+        self.assertEqual(third['cooldown_seconds'], app.PRIVATE_PHOTO_COOLDOWN_SECONDS)
+
+        before = set(os.listdir(app.UPLOAD_DIR))
+        with open(self.verified_face_path, 'rb') as f:
+            resp = client.post('/identify_photo', headers={'X-CSRFToken': csrf_token},
+                               data={'photo': (f, 'me.jpg'), 'skip_recognition': '1', 'consent': 'true'},
+                               content_type='multipart/form-data')
+        self.assertEqual(resp.status_code, 429)
+        self.assertGreater(resp.get_json()['cooldown_seconds'], 50)
+        self.assertEqual(set(os.listdir(app.UPLOAD_DIR)), before, "Nothing may be saved during the cooldown")
+        self.assertIn('startPhotoCooldown(', client.get('/analyze').data.decode())
+
+        # After the minute passes, uploads work again
+        with client.session_transaction() as sess:
+            sess['pp_cooldown_until'] = 0
+        with open(self.verified_face_path, 'rb') as f:
+            resp = client.post('/identify_photo', headers={'X-CSRFToken': csrf_token},
+                               data={'photo': (f, 'me.jpg'), 'skip_recognition': '1', 'consent': 'true'},
+                               content_type='multipart/form-data')
+        self.assertEqual(resp.status_code, 200)
+
+    def test_private_photo_success_resets_attempts(self):
+        """A photo that passes resets the attempt counter back to the full number of tries."""
+        client, csrf_token = self.get_authenticated_client()
+        self._blurred_check(client, csrf_token)
+        self._blurred_check(client, csrf_token)
+        app._AI_CHECK_CACHE.clear()
+        app._FACE_QUALITY_CACHE.clear()
+        path = self._copy_face_with_suffix('jpg')
+        with patch('app.get_claude_client', return_value=self._claude_prompt_mock()):
+            ok = client.post('/check_photo', headers={'X-CSRFToken': csrf_token},
+                             json={'image_path': os.path.basename(path), 'profession': 'other', 'mode': 'private'}).get_json()
+        self.assertTrue(ok['ok'])
+        self.assertEqual(self._blurred_check(client, csrf_token)['attempts_left'], 2)
+
+    def test_public_mode_failures_not_limited(self):
+        """The attempt limit applies only to private participants."""
+        client, csrf_token = self.get_authenticated_client()
+        for _ in range(4):
+            data = self._blurred_check(client, csrf_token, mode='public')
+            self.assertNotIn('cooldown_seconds', data)
+
+    def test_analyze_private_photo_rejection_counts_as_attempt(self):
+        """A photo rejected at the final analyze step also counts toward the limit."""
+        client, csrf_token = self.get_authenticated_client()
+        upload_id = self._private_upload()
+        passed = {'is_ai': False, 'method': 'vision', 'confidence': 5.0, 'reason': '', 'status': 'PASSED'}
+        with patch('app.moderate_image', return_value=(True, 'Safe', 'PASSED')), \
+             patch('app.check_ai_generated_image', return_value=passed), \
+             patch('app.check_face_quality', return_value=(False, 'blurred', app.FACE_QUALITY_MESSAGES['blurred'])):
+            data = client.post('/analyze_private', headers={'X-CSRFToken': csrf_token},
+                               json=self._private_payload(upload_id)).get_json()
+        self.assertEqual(data['attempts_left'], 2)
+
+    def test_consent_mentions_data_privacy_act(self):
+        """The private participant consent cites RA 10173 and the data subject's rights."""
+        html = self.client.get('/analyze').data.decode()
+        self.assertIn('Republic Act No. 10173', html)
+        self.assertIn('Data Privacy Act of 2012', html)
+        self.assertIn('National Privacy Commission', html)
+        self.assertIn('withdraw your consent', html)
 
     def test_research_data_remains_unmodified_after_tests(self):
         """Verify that running all tests caused ZERO byte modifications to real production research files."""

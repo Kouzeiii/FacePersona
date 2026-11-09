@@ -196,7 +196,7 @@
     <div class="section-header-compact">
         <div>
             <h2 class="section-title">Multimodal Analytical Pipeline</h2>
-            <p class="section-subtitle">Dual-stream methodology: visual feature extraction paired with narrative psychometric inference</p>
+            <p class="section-subtitle">Dual-stream methodology: facial feature extraction paired with a personality reference (biography or questionnaire)</p>
         </div>
     </div>
     <div class="pipeline-steps">
@@ -207,8 +207,8 @@
             </div>
             <div class="step-body">
                 <div class="step-title">Multimodal Ingestion</div>
-                <div class="step-desc">High-resolution portrait photo and biographical narrative of the subject are ingested and sanitized.</div>
-                <div class="step-meta">Photo + Biography Narrative</div>
+                <div class="step-desc">A clear face photo plus a biography (public figures) or a 10-item BFI-10 questionnaire (private participants). Photos are screened for explicit content, AI generation, and face clarity.</div>
+                <div class="step-meta">Photo + Biography or BFI-10</div>
             </div>
         </div>
         <div class="pipeline-arrow" aria-hidden="true">→</div>
@@ -219,20 +219,20 @@
             </div>
             <div class="step-body">
                 <div class="step-title">Facial HOG Extraction</div>
-                <div class="step-desc">OpenCV Haar Cascade localizes the face; 16×16 spatial cells compute a 512-D gradient magnitude fingerprint.</div>
-                <div class="step-meta">512-D Normalized Vector</div>
+                <div class="step-desc">OpenCV Haar Cascade locates the face; the crop is resized to 128×128 px and HOG measures edge directions in 8×8 px cells. The first 512 HOG values are kept and normalized.</div>
+                <div class="step-meta">512 HOG Values (Normalized)</div>
             </div>
         </div>
         <div class="pipeline-arrow" aria-hidden="true">→</div>
         <div class="pipeline-step">
             <div class="step-badge-wrap">
                 <span class="step-num">03</span>
-                <span class="step-modality-tag" style="--tag-c: #8E44AD;">AI Narrative Analysis</span>
+                <span class="step-modality-tag" style="--tag-c: #8E44AD;">Personality Reference</span>
             </div>
             <div class="step-body">
-                <div class="step-title">LLM Psychometric Inference</div>
-                <div class="step-desc">Claude AI psychometric reasoning engine evaluates biographical narratives into Big Five OCEAN dimensions (0–100).</div>
-                <div class="step-meta">LLM-Inferred OCEAN Reference Scores</div>
+                <div class="step-title">Reference OCEAN Scoring</div>
+                <div class="step-desc">Public figures: Claude AI rates the biography on each Big Five trait (0–100). Private participants: scores are computed from their own BFI-10 answers.</div>
+                <div class="step-meta">OCEAN Reference Scores (0–100)</div>
             </div>
         </div>
         <div class="pipeline-arrow" aria-hidden="true">→</div>
@@ -243,8 +243,8 @@
             </div>
             <div class="step-body">
                 <div class="step-title">Cross-Modal ML Prediction</div>
-                <div class="step-desc">Trained Random Forest regressor predicts OCEAN traits directly from facial gradient representations with score agreement check.</div>
-                <div class="step-meta">Random Forest + Score Agreement</div>
+                <div class="step-desc">Features are scaled and reduced by PCA (10 components); a Random Forest (200 trees, trained on the 103-subject baseline) predicts OCEAN from the face, then compares it with the reference scores.</div>
+                <div class="step-meta">Random Forest + Agreement Check</div>
             </div>
         </div>
     </div>
